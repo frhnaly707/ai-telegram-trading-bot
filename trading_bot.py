@@ -13,7 +13,15 @@ import time
 # Required imports (install via pip)
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from pybit.unified_trading import HTTP
+import os
+
+EXCHANGE = os.getenv("EXCHANGE", "bybit").lower()
+
+if EXCHANGE == "bitget":
+    from exchange_bitget import BitgetExecutor
+else:
+    from pybit.unified_trading import HTTP
+
 import yaml
 import openai
 from telethon import TelegramClient, events
