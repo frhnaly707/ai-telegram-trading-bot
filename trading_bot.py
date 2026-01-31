@@ -1,42 +1,67 @@
 import os
 import re
 import json
-import yaml
 import time
+import yaml
 import logging
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
-
-from dotenv import load_dotenv
-load_dotenv()
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Any, Tuple
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    ContextTypes,
-    CallbackQueryHandler,
+    CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
     filters,
 )
 
-# Optional: AI analysis
-USE_OPENAI = bool(os.getenv("OPENAI_API_KEY", "").strip())
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("trading_bot")
 
-# Trading
-EXCHANGE_DEFAULT = os.getenv("EXCHANGE", "bitget").lower()
-SAFE_MODE_DEFAULT = os.getenv("SAFE_MODE", "ON").upper()  # ON = paper only
+# =========================
+# ENV
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Storage
+EXCHANGE = os.getenv("EXCHANGE", "bitget").strip().lower()  # bitget | bybit (bitget implemented)
+SAFE_MODE = os.getenv("SAFE_MODE", "ON").strip().upper()    # ON = paper only, OFF = real trade
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
+DEFAULT_RISK_PCT = float(os.getenv("DEFAULT_RISK_PCT", "1.0"))  # 0-5 recommended
+ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip()  # optional: channel id for alerts (e.g. -1001234567890)
+DELETE_WEBHOOK = os.getenv("DELETE_WEBHOOK", "true").strip().lower() in ("1", "true", "yes")
+
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("wizard_bot")
+# Optional: OpenAI (only used if USE_AI=1)
+USE_AI = os.getenv("USE_AI", "0").strip() in ("1", "true", "yes")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# =========================
+# Conversation states
+# =========================
+(
+    ST_MENU,
+    ST_SET_API_KEY,
+    ST_SET_API_SECRET,
+    ST_SET_PASSPHRASE,
+    ST_SET_ALERT_CHANNEL,
+    ST_SET_RISK,
+    ST_SET_LEVERAGE,
+) = range(7)
 
 
 # =========================
@@ -44,535 +69,758 @@ log = logging.getLogger("wizard_bot")
 # =========================
 @dataclass
 class TradingSignal:
-    direction: str            # LONG/SHORT
-    symbol: str               # BTCUSDT
-    entry: Optional[float]    # None => MARKET
-    take_profit: List[float]
-    stop_loss: Optional[float]
+    direction: str               # LONG / SHORT
+    symbol: str                  # BTC/USDT or BTCUSDT normalized
+    entry: Optional[float]       # entry price (optional)
+    tps: List[float]             # take profit levels
+    sl: Optional[float]          # stop loss
     leverage: int
-    raw_text: str
-    confidence: float = 0.0
+    raw: str
+    confidence: float = 0.0      # 0-100
 
 
 # =========================
-# Simple Config Manager
+# Config storage
 # =========================
-class ConfigManager:
+class ConfigStore:
     def __init__(self, path: str):
         self.path = path
         self.data = self._load()
 
-    def _load(self) -> dict:
-        default = {
-            "users": {},        # user_id -> {exchange, api_key, api_secret, api_passphrase, auto_trade, risk, leverage}
-            "signal_sources": {}  # source_chat_id(str) -> {title, enabled}
+    def _default(self) -> Dict[str, Any]:
+        return {
+            "users": {
+                # "123": {"api_key":"", "api_secret":"", "passphrase":"", "auto_trade": False, "risk": 1.0, "leverage": 10}
+            },
+            "monitored_channels": {
+                # "-100123...": {"title":"...", "enabled": True}
+            },
+            "alert_channel_id": None,  # overrides env if set
         }
+
+    def _load(self) -> Dict[str, Any]:
         if not os.path.exists(self.path):
-            return default
+            return self._default()
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 loaded = yaml.safe_load(f) or {}
-            # merge
-            default.update(loaded)
-            default["users"] = default.get("users", {}) or {}
-            default["signal_sources"] = default.get("signal_sources", {}) or {}
-            return default
+            base = self._default()
+            # shallow merge
+            base.update(loaded)
+            base["users"] = loaded.get("users", base["users"])
+            base["monitored_channels"] = loaded.get("monitored_channels", base["monitored_channels"])
+            return base
         except Exception as e:
-            log.error(f"Failed to load config: {e}")
-            return default
+            logger.error("Failed to load config: %s", e)
+            return self._default()
 
-    def save(self):
-        with open(self.path, "w", encoding="utf-8") as f:
-            yaml.dump(self.data, f, sort_keys=False)
+    def save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(self.data, f, sort_keys=False, allow_unicode=True)
+        except Exception as e:
+            logger.error("Failed to save config: %s", e)
 
-    def get_user(self, user_id: int) -> dict:
-        return self.data["users"].get(str(user_id), {})
+    def user_get(self, user_id: int) -> Optional[Dict[str, Any]]:
+        return self.data.get("users", {}).get(str(user_id))
 
-    def set_user(self, user_id: int, patch: dict):
-        cur = self.data["users"].get(str(user_id), {})
-        cur.update(patch)
-        self.data["users"][str(user_id)] = cur
+    def user_ensure(self, user_id: int) -> Dict[str, Any]:
+        users = self.data.setdefault("users", {})
+        users.setdefault(str(user_id), {
+            "api_key": "",
+            "api_secret": "",
+            "passphrase": "",
+            "auto_trade": False,
+            "risk": DEFAULT_RISK_PCT,
+            "leverage": DEFAULT_LEVERAGE,
+        })
+        return users[str(user_id)]
+
+    def user_set(self, user_id: int, key: str, value: Any) -> None:
+        u = self.user_ensure(user_id)
+        u[key] = value
         self.save()
 
-    def register_source(self, chat_id: int, title: str):
-        self.data["signal_sources"][str(chat_id)] = {"title": title, "enabled": True}
+    def add_monitored_channel(self, chat_id: int, title: str) -> None:
+        ch = self.data.setdefault("monitored_channels", {})
+        ch[str(chat_id)] = {"title": title, "enabled": True}
         self.save()
 
-    def remove_source(self, chat_id: int):
-        if str(chat_id) in self.data["signal_sources"]:
-            del self.data["signal_sources"][str(chat_id)]
-            self.save()
+    def remove_monitored_channel(self, chat_id: int) -> None:
+        ch = self.data.setdefault("monitored_channels", {})
+        ch.pop(str(chat_id), None)
+        self.save()
 
-    def is_source_allowed(self, chat_id: int) -> bool:
-        src = self.data["signal_sources"].get(str(chat_id))
-        return bool(src and src.get("enabled", True))
+    def list_channels(self) -> Dict[str, Any]:
+        return self.data.get("monitored_channels", {})
 
-    def list_sources(self) -> List[dict]:
-        out = []
-        for k, v in self.data["signal_sources"].items():
-            out.append({"chat_id": int(k), "title": v.get("title", ""), "enabled": v.get("enabled", True)})
-        return out
+    def is_monitored(self, chat_id: int) -> bool:
+        ch = self.data.get("monitored_channels", {})
+        item = ch.get(str(chat_id))
+        return bool(item and item.get("enabled", True))
 
-
-cfg = ConfigManager(CONFIG_FILE)
-
-
-# =========================
-# UI helpers
-# =========================
-def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    user = cfg.get_user(user_id)
-    is_registered = bool(user.get("api_key"))
-    auto = bool(user.get("auto_trade", False))
-    safe = user.get("safe_mode", SAFE_MODE_DEFAULT)
-
-    btn_setup = "✅ Update API" if is_registered else "🧩 Setup (Wizard)"
-    btn_auto = "⛔ Auto-Trade OFF" if auto else "⚡ Auto-Trade ON"
-    btn_safe = f"🧪 SAFE_MODE: {safe}"
-
-    keyboard = [
-        [InlineKeyboardButton(btn_setup, callback_data="MENU_SETUP")],
-        [InlineKeyboardButton("📡 Register Signal Channel", callback_data="MENU_REG_SOURCE")],
-        [InlineKeyboardButton("📋 Sources List", callback_data="MENU_LIST_SOURCES")],
-        [InlineKeyboardButton(btn_safe, callback_data="MENU_TOGGLE_SAFE"),
-         InlineKeyboardButton(btn_auto, callback_data="MENU_TOGGLE_AUTO")],
-        [InlineKeyboardButton("📈 Analisa Coin", callback_data="MENU_ANALYZE")],
-        [InlineKeyboardButton("📊 Status", callback_data="MENU_STATUS")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def send_or_edit(update: Update, text: str, kb: Optional[InlineKeyboardMarkup] = None):
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text=text, reply_markup=kb, disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(text=text, reply_markup=kb, disable_web_page_preview=True)
-
-
-# =========================
-# Signal Parsing (basic)
-# =========================
-def parse_signal(text: str) -> Optional[TradingSignal]:
-    t = text.strip().upper()
-
-    # direction
-    direction = None
-    if re.search(r"\bLONG\b", t): direction = "LONG"
-    if re.search(r"\bSHORT\b", t): direction = "SHORT"
-    if not direction:
+    def get_alert_channel_id(self) -> Optional[int]:
+        # priority: config > env
+        if self.data.get("alert_channel_id"):
+            try:
+                return int(self.data["alert_channel_id"])
+            except:
+                return None
+        if ALERT_CHANNEL_ID:
+            try:
+                return int(ALERT_CHANNEL_ID)
+            except:
+                return None
         return None
 
-    # symbol
-    m = re.search(r"\b([A-Z0-9]{3,15})\s*(USDT)\b", t)
-    symbol = None
-    if m:
-        symbol = f"{m.group(1)}USDT"
-    else:
-        # allow "BTC/USDT"
-        m2 = re.search(r"\b([A-Z0-9]{3,15})\s*/\s*USDT\b", t)
-        if m2:
-            symbol = f"{m2.group(1)}USDT"
-    if not symbol:
-        return None
-
-    # entry price optional
-    entry = None
-    m_entry = re.search(r"\bENTRY\b\s*([0-9]+(\.[0-9]+)?)", t)
-    if m_entry:
-        entry = float(m_entry.group(1))
-
-    # leverage
-    lev = 10
-    m_lev = re.search(r"\bLEV(ERAGE)?\b\s*([0-9]{1,3})", t)
-    if m_lev:
-        lev = int(m_lev.group(2))
-
-    # SL
-    sl = None
-    m_sl = re.search(r"\bSL\b\s*([0-9]+(\.[0-9]+)?)", t)
-    if m_sl:
-        sl = float(m_sl.group(1))
-
-    # TP (allow 1..n)
-    tp = []
-    # "TP 43500 44000"
-    m_tp = re.search(r"\bTP\b\s*([0-9\.\s,]+)", t)
-    if m_tp:
-        nums = re.findall(r"([0-9]+(\.[0-9]+)?)", m_tp.group(1))
-        tp = [float(x[0]) for x in nums][:5]
-
-    return TradingSignal(
-        direction=direction,
-        symbol=symbol,
-        entry=entry,
-        take_profit=tp,
-        stop_loss=sl,
-        leverage=lev,
-        raw_text=text,
-        confidence=90.0,  # basic parser confidence
-    )
+    def set_alert_channel_id(self, chat_id: int) -> None:
+        self.data["alert_channel_id"] = int(chat_id)
+        self.save()
 
 
 # =========================
-# Bitget Executor (ccxt)
+# Signal parsing (regex)
+# =========================
+class SignalParser:
+    # Accept formats:
+    # LONG BTCUSDT
+    # ENTRY 43000
+    # TP 43500 44000
+    # SL 42500
+    # LEV 10
+    DIRECTION_RE = re.compile(r"\b(LONG|SHORT|BUY|SELL)\b", re.IGNORECASE)
+    SYMBOL_RE = re.compile(r"\b([A-Z0-9]{2,15})(?:/)?(USDT)\b", re.IGNORECASE)
+    ENTRY_RE = re.compile(r"\bENTRY\b[:\s]*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+    SL_RE = re.compile(r"\bSL\b[:\s]*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+    LEV_RE = re.compile(r"\b(LEV|LEVERAGE)\b[:\s]*([0-9]{1,3})", re.IGNORECASE)
+    # TP can be: "TP 43500 44000" or multiple lines "TP1 43500" etc.
+    TP_ALL_RE = re.compile(r"\bTP\d*\b[:\s]*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+    def parse(self, text: str) -> Optional[TradingSignal]:
+        if not text:
+            return None
+        t = text.strip()
+
+        m_dir = self.DIRECTION_RE.search(t)
+        if not m_dir:
+            return None
+        direction = m_dir.group(1).upper()
+        if direction == "BUY":
+            direction = "LONG"
+        if direction == "SELL":
+            direction = "SHORT"
+
+        m_sym = self.SYMBOL_RE.search(t)
+        if not m_sym:
+            return None
+        base = m_sym.group(1).upper()
+        symbol = f"{base}/USDT"
+
+        entry = None
+        m_entry = self.ENTRY_RE.search(t)
+        if m_entry:
+            entry = float(m_entry.group(1))
+
+        sl = None
+        m_sl = self.SL_RE.search(t)
+        if m_sl:
+            sl = float(m_sl.group(1))
+
+        leverage = DEFAULT_LEVERAGE
+        m_lev = self.LEV_RE.search(t)
+        if m_lev:
+            leverage = int(m_lev.group(2))
+
+        tps = [float(x) for x in self.TP_ALL_RE.findall(t)]
+        # Also support: "TP 43500 44000" in one line
+        if not tps:
+            # try a simpler split after "TP"
+            lines = t.splitlines()
+            for line in lines:
+                if re.search(r"\bTP\b", line, re.IGNORECASE):
+                    nums = re.findall(r"([0-9]+(?:\.[0-9]+)?)", line)
+                    if nums:
+                        tps.extend([float(n) for n in nums])
+        # dedup keep order
+        seen = set()
+        tps2 = []
+        for x in tps:
+            if x not in seen:
+                seen.add(x)
+                tps2.append(x)
+        tps = tps2
+
+        # confidence heuristic
+        conf = 60.0
+        if entry is not None:
+            conf += 10
+        if sl is not None:
+            conf += 10
+        if tps:
+            conf += 10
+        if leverage:
+            conf += 5
+        conf = min(conf, 95.0)
+
+        return TradingSignal(
+            direction=direction,
+            symbol=symbol,
+            entry=entry,
+            tps=tps,
+            sl=sl,
+            leverage=leverage,
+            raw=t,
+            confidence=conf,
+        )
+
+
+# =========================
+# Exchange executor (Bitget via ccxt)
 # =========================
 class BitgetExecutor:
     """
-    Real trading uses ccxt.
-    Requires: ccxt
-    Bitget usually needs apiKey + secret + password(passphrase).
+    Real trading uses CCXT.
+    For Bitget futures/swap you usually need:
+    - apiKey
+    - secret
+    - password (passphrase)
     """
-    def __init__(self, api_key: str, api_secret: str, passphrase: str, sandbox: bool = False):
-        import ccxt  # type: ignore
-        self.ex = ccxt.bitget({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "password": passphrase,  # IMPORTANT
+    def __init__(self, api_key: str, api_secret: str, passphrase: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.passphrase = passphrase
+        self._ex = None
+
+    def _init(self):
+        if self._ex:
+            return
+        import ccxt  # pip install ccxt
+        self._ex = ccxt.bitget({
+            "apiKey": self.api_key,
+            "secret": self.api_secret,
+            "password": self.passphrase,
             "enableRateLimit": True,
+            # If you need futures, bitget uses "swap" markets in ccxt:
+            "options": {"defaultType": "swap"},
         })
-        if sandbox:
-            # NOTE: Bitget sandbox support depends on ccxt; leave false if not available.
-            try:
-                self.ex.set_sandbox_mode(True)
-            except Exception:
-                pass
 
-    def place_order(self, signal: TradingSignal, qty: float) -> dict:
-        # futures/perp: ccxt market type config can vary; simplest: createMarketOrder/Limit
-        side = "buy" if signal.direction == "LONG" else "sell"
-        if signal.entry is None:
-            order = self.ex.create_market_order(signal.symbol, side, qty)
+    def place_market(self, symbol: str, side: str, amount: float, params: Optional[dict] = None) -> Dict[str, Any]:
+        self._init()
+        params = params or {}
+        # side: buy/sell
+        return self._ex.create_order(symbol, "market", side, amount, None, params)
+
+    def set_leverage(self, symbol: str, leverage: int) -> None:
+        self._init()
+        # ccxt unified: setLeverage on some exchanges
+        if hasattr(self._ex, "set_leverage"):
+            self._ex.set_leverage(leverage, symbol)
         else:
-            order = self.ex.create_limit_order(signal.symbol, side, qty, signal.entry)
-        return order
+            # best effort
+            pass
+
+    def fetch_ticker_last(self, symbol: str) -> float:
+        self._init()
+        t = self._ex.fetch_ticker(symbol)
+        return float(t["last"])
+
+    def market_amount_from_risk(
+        self,
+        symbol: str,
+        risk_pct: float,
+        leverage: int,
+        usdt_balance: float,
+        entry_price: Optional[float],
+    ) -> float:
+        """
+        Simple sizing:
+        position_value = balance * (risk_pct/100) * leverage
+        qty = position_value / price
+        """
+        price = entry_price if entry_price else self.fetch_ticker_last(symbol)
+        position_value = usdt_balance * (risk_pct / 100.0) * leverage
+        qty = position_value / price
+        # round a bit
+        return float(f"{qty:.4f}")
+
+    def fetch_usdt_balance(self) -> float:
+        self._init()
+        bal = self._ex.fetch_balance()
+        # in swap accounts, USDT might show in total/free
+        usdt = 0.0
+        if "USDT" in bal.get("free", {}):
+            usdt = float(bal["free"]["USDT"])
+        elif "USDT" in bal.get("total", {}):
+            usdt = float(bal["total"]["USDT"])
+        return usdt
 
 
 # =========================
-# Bot State Machine (per user)
+# Telegram Bot App
 # =========================
-# user_data keys:
-# step: "WAIT_API_KEY" | "WAIT_API_SECRET" | "WAIT_API_PASSPHRASE" | "WAIT_ANALYZE_SYMBOL" | "WAIT_FORWARD_SOURCE"
-# temp: dict scratch
+class TradingBotApp:
+    def __init__(self, store: ConfigStore):
+        self.store = store
+        self.parser = SignalParser()
 
-def set_step(context: ContextTypes.DEFAULT_TYPE, step: Optional[str]):
-    if step is None:
-        context.user_data.pop("step", None)
-        context.user_data.pop("temp", None)
-    else:
-        context.user_data["step"] = step
-        context.user_data.setdefault("temp", {})
+    # ---------- UI helpers ----------
+    def _menu_kb(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Setup API (Bitget)", callback_data="menu_setup_api")],
+            [InlineKeyboardButton("📌 Set Alert Channel", callback_data="menu_set_alert")],
+            [InlineKeyboardButton("📺 Link Channel (monitor)", callback_data="menu_link_channel")],
+            [InlineKeyboardButton("⚡ Toggle Auto-Trade", callback_data="menu_toggle_autotrade")],
+            [InlineKeyboardButton("💰 Set Risk %", callback_data="menu_set_risk")],
+            [InlineKeyboardButton("📈 Set Leverage", callback_data="menu_set_lev")],
+            [InlineKeyboardButton("📊 Status", callback_data="menu_status")],
+        ])
 
-def get_step(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
-    return context.user_data.get("step")
+    async def _send_menu(self, update: Update, text: str) -> None:
+        if update.message:
+            await update.message.reply_text(text, reply_markup=self._menu_kb())
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(text, reply_markup=self._menu_kb())
 
-
-# =========================
-# Handlers
-# =========================
-async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # ensure user exists
-    if not cfg.get_user(user_id):
-        cfg.set_user(user_id, {
-            "exchange": EXCHANGE_DEFAULT,
-            "auto_trade": False,
-            "risk": 1.0,
-            "leverage": 10,
-            "safe_mode": SAFE_MODE_DEFAULT,
-        })
-
-    text = (
-        "🤖 *Lunero AI Trading Bot*\n\n"
-        "Bot ini kerja seperti ini:\n"
-        "1) Kamu *register channel sumber signal* (dengan forward 1 pesan dari channel itu ke bot)\n"
-        "2) Bot akan *parse signal* → kirim *ALERT* ke DM kamu\n"
-        "3) Jika Auto-Trade ON dan SAFE_MODE OFF → bot bisa kirim order ke exchange\n\n"
-        "Klik menu di bawah."
-    )
-    await send_or_edit(update, text, main_menu_kb(user_id))
-
-
-async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    user_id = q.from_user.id
-    user = cfg.get_user(user_id) or {}
-
-    data = q.data
-
-    if data == "MENU_SETUP":
-        set_step(context, "WAIT_API_KEY")
-        context.user_data["temp"] = {}
-        await send_or_edit(update,
-            "🧩 *Setup API (Step 1/3)*\n\nKirim *API KEY* kamu (teks saja).",
-            None
+    # ---------- Commands ----------
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        self.store.user_ensure(uid)
+        mode = SAFE_MODE
+        ex = EXCHANGE.upper()
+        msg = (
+            f"🤖 *Auto-Trading Bot*\n"
+            f"Exchange: *{ex}*\n"
+            f"SAFE_MODE: *{mode}*  (ON = paper only)\n\n"
+            f"Gunakan menu tombol di bawah untuk setup step-by-step.\n"
+            f"User ID kamu: `{uid}`"
         )
-        return
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=self._menu_kb())
 
-    if data == "MENU_REG_SOURCE":
-        set_step(context, "WAIT_FORWARD_SOURCE")
-        await send_or_edit(update,
-            "📡 *Register Signal Channel*\n\n"
-            "Cara paling gampang:\n"
-            "1) Tambahkan bot sebagai *admin* di channel sumber signal\n"
-            "2) *Forward 1 pesan* dari channel itu ke bot ini\n\n"
-            "Sekarang: *forward 1 pesan dari channel sumber signal* ke sini.",
-            None
-        )
-        return
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._status(update)
 
-    if data == "MENU_LIST_SOURCES":
-        sources = cfg.list_sources()
-        if not sources:
-            await send_or_edit(update, "📋 Belum ada source. Klik *Register Signal Channel* dulu.", main_menu_kb(user_id))
+    async def cmd_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        u = self.store.user_ensure(uid)
+        u["auto_trade"] = not bool(u.get("auto_trade", False))
+        self.store.save()
+        await update.message.reply_text(f"✅ Auto-trade = {u['auto_trade']}")
+
+    async def cmd_set_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not context.args:
+            await update.message.reply_text("Usage: /set_risk 1.0  (0-5)")
             return
-
-        lines = ["📋 *Signal Sources:*"]
-        for s in sources:
-            lines.append(f"- `{s['chat_id']}` | {s['title']} | {'ON' if s['enabled'] else 'OFF'}")
-        await send_or_edit(update, "\n".join(lines), main_menu_kb(user_id))
-        return
-
-    if data == "MENU_TOGGLE_SAFE":
-        cur = user.get("safe_mode", SAFE_MODE_DEFAULT)
-        newv = "OFF" if cur == "ON" else "ON"
-        cfg.set_user(user_id, {"safe_mode": newv})
-        await send_or_edit(update, f"🧪 SAFE_MODE sekarang: *{newv}*", main_menu_kb(user_id))
-        return
-
-    if data == "MENU_TOGGLE_AUTO":
-        if not user.get("api_key"):
-            await send_or_edit(update, "❌ Kamu belum setup API. Klik *Setup (Wizard)* dulu.", main_menu_kb(user_id))
-            return
-        newv = not bool(user.get("auto_trade", False))
-        cfg.set_user(user_id, {"auto_trade": newv})
-        await send_or_edit(update, f"⚡ Auto-Trade sekarang: *{'ON' if newv else 'OFF'}*", main_menu_kb(user_id))
-        return
-
-    if data == "MENU_ANALYZE":
-        set_step(context, "WAIT_ANALYZE_SYMBOL")
-        await send_or_edit(update, "📈 Kirim symbol untuk dianalisa. Contoh: `BTCUSDT`", None)
-        return
-
-    if data == "MENU_STATUS":
-        sources = cfg.list_sources()
-        text = (
-            "📊 *Status*\n\n"
-            f"Exchange: *{user.get('exchange', EXCHANGE_DEFAULT).upper()}*\n"
-            f"SAFE_MODE: *{user.get('safe_mode', SAFE_MODE_DEFAULT)}*\n"
-            f"Auto-Trade: *{user.get('auto_trade', False)}*\n"
-            f"Risk: *{user.get('risk', 1.0)}%*\n"
-            f"Leverage: *{user.get('leverage', 10)}*\n"
-            f"Sources: *{len(sources)}*\n\n"
-            f"Your ID: `{user_id}`"
-        )
-        await send_or_edit(update, text, main_menu_kb(user_id))
-        return
-
-    # fallback
-    await send_or_edit(update, "Menu tidak dikenal.", main_menu_kb(user_id))
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = cfg.get_user(user_id) or {}
-    step = get_step(context)
-    text = (update.message.text or "").strip()
-
-    # ----- Wizard: API setup -----
-    if step == "WAIT_API_KEY":
-        cfg.set_user(user_id, {"api_key": text})
-        set_step(context, "WAIT_API_SECRET")
-        await update.message.reply_text("🧩 *Setup API (Step 2/3)*\n\nKirim *API SECRET* kamu (teks saja).", parse_mode="Markdown")
-        return
-
-    if step == "WAIT_API_SECRET":
-        cfg.set_user(user_id, {"api_secret": text})
-        set_step(context, "WAIT_API_PASSPHRASE")
-        await update.message.reply_text(
-            "🧩 *Setup API (Step 3/3)*\n\n"
-            "Kirim *API PASSPHRASE* Bitget kamu.\n"
-            "⚠️ Ini wajib di Bitget (biasanya).",
-            parse_mode="Markdown"
-        )
-        return
-
-    if step == "WAIT_API_PASSPHRASE":
-        cfg.set_user(user_id, {"api_passphrase": text})
-        set_step(context, None)
-        await update.message.reply_text("✅ API tersimpan. Sekarang register channel sumber signal.", parse_mode="Markdown")
-        await update.message.reply_text("Kembali ke menu:", reply_markup=main_menu_kb(user_id))
-        return
-
-    # ----- Analyze coin -----
-    if step == "WAIT_ANALYZE_SYMBOL":
-        symbol = text.upper().replace("/", "")
-        if not symbol.endswith("USDT"):
-            symbol += "USDT"
-
-        set_step(context, None)
-
-        # Simple analysis (no price fetch here to keep it stable)
-        # You can enhance by calling OpenAI or adding ccxt fetchTicker.
-        analysis = (
-            f"📈 *Analisa (basic)*\n\n"
-            f"Symbol: *{symbol}*\n"
-            "Saran implementasi:\n"
-            "- Ambil harga terakhir (ccxt fetchTicker)\n"
-            "- Hitung EMA/RSI (ta-lib/pandas-ta)\n"
-            "- Buat summary & bias\n\n"
-            "Kalau kamu mau, aku bisa upgrade jadi analisa lengkap (EMA/RSI/MACD) + data real-time."
-        )
-        await update.message.reply_text(analysis, parse_mode="Markdown", reply_markup=main_menu_kb(user_id))
-        return
-
-    # If user types random text in DM, show menu
-    await update.message.reply_text("Pilih dari menu:", reply_markup=main_menu_kb(user_id))
-
-
-async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    This handler catches:
-    - forwarded messages to register a channel source
-    - channel posts (signals) when bot is admin in that channel
-    """
-    user_id = update.effective_user.id if update.effective_user else None
-    step = get_step(context)
-
-    # ----- Register source: user forwards a message from a channel -----
-    if step == "WAIT_FORWARD_SOURCE" and update.message:
-        fwd = update.message.forward_from_chat
-        if not fwd:
-            await update.message.reply_text("❌ Forward-nya tidak terbaca. Forward *dari channel*, bukan copy-paste.")
-            return
-
-        # register source chat id
-        cfg.register_source(fwd.id, fwd.title or fwd.username or str(fwd.id))
-        set_step(context, None)
-
-        await update.message.reply_text(
-            f"✅ Source registered:\n- Title: {fwd.title}\n- Chat ID: {fwd.id}\n\n"
-            "Sekarang kalau ada posting signal di channel itu, bot akan deteksi & kirim alert.",
-        )
-        if user_id:
-            await update.message.reply_text("Kembali ke menu:", reply_markup=main_menu_kb(user_id))
-        return
-
-    # ----- Detect signals from channel posts -----
-    # channel_post update arrives as update.channel_post (python-telegram-bot),
-    # but also can arrive as update.message in some cases. We'll check both.
-    msg = update.channel_post or update.message
-    if not msg:
-        return
-
-    # Only handle if it's from registered source
-    chat = msg.chat
-    if not chat:
-        return
-
-    if not cfg.is_source_allowed(chat.id):
-        return
-
-    text = (msg.text or msg.caption or "").strip()
-    if not text:
-        return
-
-    sig = parse_signal(text)
-    if not sig:
-        return
-
-    # ALERT to all registered users (simple approach)
-    # If you want only the admin/owner: send only to the person who configured.
-    all_users = list(cfg.data.get("users", {}).keys())
-
-    alert = (
-        "🚨 *SIGNAL DETECTED*\n\n"
-        f"Source: *{chat.title or chat.username or chat.id}*\n"
-        f"Direction: *{sig.direction}*\n"
-        f"Symbol: *{sig.symbol}*\n"
-        f"Entry: *{sig.entry if sig.entry else 'MARKET'}*\n"
-        f"TP: *{', '.join(map(str, sig.take_profit)) if sig.take_profit else '-'}*\n"
-        f"SL: *{sig.stop_loss if sig.stop_loss else '-'}*\n"
-        f"Lev: *{sig.leverage}*\n"
-        f"Conf: *{sig.confidence}%*\n"
-    )
-
-    for uid in all_users:
         try:
-            await context.bot.send_message(chat_id=int(uid), text=alert, parse_mode="Markdown")
-        except Exception as e:
-            log.warning(f"Failed to alert user {uid}: {e}")
+            risk = float(context.args[0])
+            if risk < 0 or risk > 5:
+                raise ValueError("range")
+            self.store.user_set(uid, "risk", risk)
+            await update.message.reply_text(f"✅ Risk set to {risk}%")
+        except:
+            await update.message.reply_text("❌ Risk invalid. Pakai 0-5, contoh: /set_risk 1.0")
 
-    # ----- Auto-trade (Bitget) -----
-    for uid in all_users:
-        ucfg = cfg.get_user(int(uid))
-        if not ucfg.get("auto_trade", False):
-            continue
-
-        safe_mode = ucfg.get("safe_mode", SAFE_MODE_DEFAULT)
-        if safe_mode == "ON":
-            # paper only
-            try:
-                await context.bot.send_message(
-                    chat_id=int(uid),
-                    text="🧪 SAFE_MODE=ON → tidak kirim order ke exchange (paper only).",
-                )
-            except Exception:
-                pass
-            continue
-
-        # must have api fields
-        api_key = ucfg.get("api_key")
-        api_secret = ucfg.get("api_secret")
-        api_pass = ucfg.get("api_passphrase")
-        if not (api_key and api_secret and api_pass):
-            try:
-                await context.bot.send_message(
-                    chat_id=int(uid),
-                    text="❌ API Bitget belum lengkap. Butuh API_KEY + API_SECRET + API_PASSPHRASE.",
-                )
-            except Exception:
-                pass
-            continue
-
-        # Very basic sizing: fixed risk not implemented (placeholder)
-        qty = 0.001  # TODO: ganti dengan sizing berdasarkan balance+risk
-
+    async def cmd_set_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not context.args:
+            await update.message.reply_text("Usage: /set_leverage 10")
+            return
         try:
-            executor = BitgetExecutor(api_key, api_secret, api_pass, sandbox=False)
-            order = executor.place_order(sig, qty)
-            await context.bot.send_message(
-                chat_id=int(uid),
-                text=f"✅ Order sent to Bitget:\n`{json.dumps(order, indent=2)[:3500]}`",
-                parse_mode="Markdown"
+            lev = int(context.args[0])
+            if lev < 1 or lev > 125:
+                raise ValueError("range")
+            self.store.user_set(uid, "leverage", lev)
+            await update.message.reply_text(f"✅ Leverage set to {lev}")
+        except:
+            await update.message.reply_text("❌ Leverage invalid. 1-125, contoh: /set_leverage 10")
+
+    async def cmd_link_here(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Jalankan command ini DI DALAM CHANNEL (sebagai post di channel),
+        bot akan menyimpan chat_id channel tsb sebagai monitored.
+        """
+        if update.channel_post:
+            chat = update.channel_post.chat
+            self.store.add_monitored_channel(chat.id, chat.title or str(chat.id))
+            await update.channel_post.reply_text("✅ Channel ini sekarang DIMONITOR oleh bot.")
+        else:
+            await update.message.reply_text("Kirim /link_here di DALAM CHANNEL (bot harus jadi admin).")
+
+    # ---------- Callback menu ----------
+    async def on_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        uid = q.from_user.id
+        self.store.user_ensure(uid)
+
+        data = q.data
+
+        if data == "menu_status":
+            await self._status(update)
+            return ConversationHandler.END
+
+        if data == "menu_toggle_autotrade":
+            u = self.store.user_ensure(uid)
+            u["auto_trade"] = not bool(u.get("auto_trade", False))
+            self.store.save()
+            await q.message.reply_text(f"✅ Auto-trade sekarang: *{u['auto_trade']}*", parse_mode=ParseMode.MARKDOWN)
+            await self._send_menu(update, "Menu:")
+            return ConversationHandler.END
+
+        if data == "menu_setup_api":
+            await q.message.reply_text(
+                "Masukkan *API KEY Bitget* kamu.\n\n"
+                "Catatan: Bitget butuh 3 item: API Key, API Secret, dan *Passphrase*.",
+                parse_mode=ParseMode.MARKDOWN,
             )
+            return ST_SET_API_KEY
+
+        if data == "menu_set_alert":
+            await q.message.reply_text(
+                "Kirim *ALERT_CHANNEL_ID*.\n\n"
+                "Cara gampang:\n"
+                "1) Tambahkan bot sebagai admin di channel alert\n"
+                "2) Post pesan apa saja di channel\n"
+                "3) Bot akan melihat chat_id di log/status.\n\n"
+                "Atau kirim angka chat_id langsung (format: -100xxxxxxxxxx).",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ST_SET_ALERT_CHANNEL
+
+        if data == "menu_set_risk":
+            await q.message.reply_text("Kirim angka risk % (0-5). Contoh: `1.0`", parse_mode=ParseMode.MARKDOWN)
+            return ST_SET_RISK
+
+        if data == "menu_set_lev":
+            await q.message.reply_text("Kirim leverage (1-125). Contoh: `10`", parse_mode=ParseMode.MARKDOWN)
+            return ST_SET_LEVERAGE
+
+        if data == "menu_link_channel":
+            await q.message.reply_text(
+                "Untuk monitor channel:\n"
+                "1) Tambahkan bot sebagai *admin* di channel target\n"
+                "2) Di channel itu, kirim command: `/link_here`\n\n"
+                "Setelah itu, semua post signal di channel akan diproses otomatis.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await self._send_menu(update, "Menu:")
+            return ConversationHandler.END
+
+        await self._send_menu(update, "Menu:")
+        return ConversationHandler.END
+
+    # ---------- Setup steps ----------
+    async def step_set_api_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        api_key = (update.message.text or "").strip()
+        if len(api_key) < 10:
+            await update.message.reply_text("❌ API key tidak valid. Coba lagi.")
+            return ST_SET_API_KEY
+        self.store.user_set(uid, "api_key", api_key)
+        await update.message.reply_text("Sekarang kirim *API SECRET*.", parse_mode=ParseMode.MARKDOWN)
+        return ST_SET_API_SECRET
+
+    async def step_set_api_secret(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        api_secret = (update.message.text or "").strip()
+        if len(api_secret) < 10:
+            await update.message.reply_text("❌ API secret tidak valid. Coba lagi.")
+            return ST_SET_API_SECRET
+        self.store.user_set(uid, "api_secret", api_secret)
+        await update.message.reply_text("Sekarang kirim *PASSPHRASE Bitget* (yang kamu set saat buat API).", parse_mode=ParseMode.MARKDOWN)
+        return ST_SET_PASSPHRASE
+
+    async def step_set_passphrase(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        passphrase = (update.message.text or "").strip()
+        if len(passphrase) < 4:
+            await update.message.reply_text("❌ Passphrase tidak valid. Coba lagi.")
+            return ST_SET_PASSPHRASE
+        self.store.user_set(uid, "passphrase", passphrase)
+        await update.message.reply_text("✅ API Bitget tersimpan.")
+        await self._send_menu(update, "Menu:")
+        return ConversationHandler.END
+
+    async def step_set_alert_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        txt = (update.message.text or "").strip()
+        try:
+            cid = int(txt)
+            self.store.set_alert_channel_id(cid)
+            await update.message.reply_text(f"✅ Alert channel id diset ke: `{cid}`", parse_mode=ParseMode.MARKDOWN)
+            await self._send_menu(update, "Menu:")
+            return ConversationHandler.END
+        except:
+            await update.message.reply_text("❌ Harus angka chat_id. Contoh: `-1001234567890`", parse_mode=ParseMode.MARKDOWN)
+            return ST_SET_ALERT_CHANNEL
+
+    async def step_set_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        try:
+            risk = float((update.message.text or "").strip())
+            if risk < 0 or risk > 5:
+                raise ValueError("range")
+            self.store.user_set(uid, "risk", risk)
+            await update.message.reply_text(f"✅ Risk set: {risk}%")
+            await self._send_menu(update, "Menu:")
+            return ConversationHandler.END
+        except:
+            await update.message.reply_text("❌ Risk invalid. 0-5. Contoh: 1.0")
+            return ST_SET_RISK
+
+    async def step_set_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        try:
+            lev = int((update.message.text or "").strip())
+            if lev < 1 or lev > 125:
+                raise ValueError("range")
+            self.store.user_set(uid, "leverage", lev)
+            await update.message.reply_text(f"✅ Leverage set: {lev}")
+            await self._send_menu(update, "Menu:")
+            return ConversationHandler.END
+        except:
+            await update.message.reply_text("❌ Leverage invalid. 1-125. Contoh: 10")
+            return ST_SET_LEVERAGE
+
+    # ---------- Core: handle channel posts ----------
+    async def on_channel_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # channel post update
+        post = update.channel_post
+        if not post or not post.text:
+            return
+
+        chat = post.chat
+        chat_id = chat.id
+
+        # Process only monitored channels
+        if not self.store.is_monitored(chat_id):
+            return
+
+        text = post.text
+        sig = self.parser.parse(text)
+        if not sig:
+            return
+
+        logger.info("Signal detected in channel %s (%s): %s %s conf=%.1f",
+                    chat.title, chat_id, sig.direction, sig.symbol, sig.confidence)
+
+        # Send alert
+        await self._send_alert(context, sig, source_channel=chat)
+
+        # Auto trade for every user who enabled
+        # NOTE: This is high-risk. Make sure SAFE_MODE=ON while testing.
+        if SAFE_MODE == "ON":
+            logger.info("SAFE_MODE=ON -> skip real trade (paper only).")
+            return
+
+        # Execute trade for users that enabled auto_trade
+        users = self.store.data.get("users", {})
+        for uid_str, uconf in users.items():
+            try:
+                uid = int(uid_str)
+            except:
+                continue
+            if not uconf.get("auto_trade", False):
+                continue
+
+            # must have api credentials
+            api_key = (uconf.get("api_key") or "").strip()
+            api_secret = (uconf.get("api_secret") or "").strip()
+            passphrase = (uconf.get("passphrase") or "").strip()
+            if not (api_key and api_secret and passphrase):
+                logger.warning("User %s missing api credentials -> skip trade", uid)
+                continue
+
+            risk = float(uconf.get("risk", DEFAULT_RISK_PCT))
+            lev = int(uconf.get("leverage", sig.leverage or DEFAULT_LEVERAGE))
+
+            await self._execute_bitget_trade(context, uid, sig, api_key, api_secret, passphrase, risk, lev)
+
+    async def _send_alert(self, context: ContextTypes.DEFAULT_TYPE, sig: TradingSignal, source_channel):
+        alert_to = self.store.get_alert_channel_id()
+        # if not set, send to source channel itself
+        if not alert_to:
+            alert_to = source_channel.id
+
+        msg = (
+            f"🚨 *SIGNAL DETECTED*\n"
+            f"Channel: *{source_channel.title}*\n\n"
+            f"• Direction: *{sig.direction}*\n"
+            f"• Symbol: *{sig.symbol}*\n"
+            f"• Entry: `{sig.entry}`\n"
+            f"• TP: `{sig.tps}`\n"
+            f"• SL: `{sig.sl}`\n"
+            f"• Lev: `{sig.leverage}`\n"
+            f"• Confidence: *{sig.confidence:.1f}%*\n\n"
+            f"_SAFE_MODE: {SAFE_MODE}_"
+        )
+        try:
+            await context.bot.send_message(chat_id=alert_to, text=msg, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
-            await context.bot.send_message(chat_id=int(uid), text=f"❌ Order failed: {e}")
+            logger.error("Failed send alert: %s", e)
+
+    async def _execute_bitget_trade(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        sig: TradingSignal,
+        api_key: str,
+        api_secret: str,
+        passphrase: str,
+        risk: float,
+        lev: int,
+    ):
+        """
+        Places market order. TP/SL automation differs per exchange;
+        here we only place main market order to prove execution works.
+        """
+        try:
+            ex = BitgetExecutor(api_key, api_secret, passphrase)
+
+            # Set leverage (best-effort)
+            try:
+                ex.set_leverage(sig.symbol, lev)
+            except Exception as e:
+                logger.warning("set_leverage failed: %s", e)
+
+            # Fetch balance and size
+            bal = ex.fetch_usdt_balance()
+            if bal <= 0:
+                raise RuntimeError("USDT balance is 0 (or cannot fetch balance).")
+
+            qty = ex.market_amount_from_risk(
+                symbol=sig.symbol,
+                risk_pct=risk,
+                leverage=lev,
+                usdt_balance=bal,
+                entry_price=sig.entry,
+            )
+
+            side = "buy" if sig.direction == "LONG" else "sell"
+
+            # Some Bitget swap markets in ccxt are like "BTC/USDT:USDT"
+            # We'll attempt to load markets and map symbol if needed.
+            try:
+                # re-init markets by calling fetch ticker
+                _ = ex.fetch_ticker_last(sig.symbol)
+                used_symbol = sig.symbol
+            except Exception:
+                # fallback common swap symbol format
+                used_symbol = f"{sig.symbol}:USDT"
+
+            order = ex.place_market(used_symbol, side, qty)
+
+            logger.info("Trade executed for user %s: %s", user_id, order.get("id", "no-id"))
+
+            # Notify user in DM
+            msg = (
+                f"✅ *AUTO TRADE EXECUTED*\n\n"
+                f"User: `{user_id}`\n"
+                f"Side: *{side.upper()}*\n"
+                f"Symbol: *{used_symbol}*\n"
+                f"Qty: `{qty}`\n"
+                f"Lev: `{lev}`\n"
+                f"Risk: `{risk}%`\n"
+                f"OrderId: `{order.get('id', 'N/A')}`\n"
+            )
+            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+
+        except Exception as e:
+            logger.error("Trade failed user %s: %s", user_id, e)
+            try:
+                await context.bot.send_message(chat_id=user_id, text=f"❌ Trade gagal: {e}")
+            except:
+                pass
+
+    async def _status(self, update: Update):
+        uid = update.effective_user.id
+        u = self.store.user_get(uid) or {}
+        chans = self.store.list_channels()
+        alert_id = self.store.get_alert_channel_id()
+
+        msg = (
+            f"📊 *Status*\n\n"
+            f"Monitored channels: *{len(chans)}*\n"
+            f"Registered users: *{len(self.store.data.get('users', {}))}*\n"
+            f"Your ID: `{uid}`\n"
+            f"Auto-trade: *{bool(u.get('auto_trade', False))}*\n"
+            f"Risk: `{u.get('risk', DEFAULT_RISK_PCT)}%`\n"
+            f"Leverage: `{u.get('leverage', DEFAULT_LEVERAGE)}`\n"
+            f"SAFE_MODE: *{SAFE_MODE}*\n"
+            f"Alert channel id: `{alert_id}`\n\n"
+            f"⚠️ Agar bot bisa baca channel: bot harus *admin* di channel tsb.\n"
+            f"Link channel: kirim `/link_here` di dalam channel."
+        )
+        if update.message:
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=self._menu_kb())
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=self._menu_kb())
 
 
-async def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+# =========================
+# Build & Run
+# =========================
+def build_app() -> Application:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env")
 
-    app = Application.builder().token(token).build()
+    store = ConfigStore(CONFIG_FILE)
+    botapp = TradingBotApp(store)
 
-    # /start
-    app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/start$"), on_start))
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # menu buttons
-    app.add_handler(CallbackQueryHandler(on_menu))
+    # (Optional) prevent "Conflict: terminated by other getUpdates request"
+    # and ensure polling can start
+    app.post_init = post_init_factory(DELETE_WEBHOOK)
 
-    # text input (wizard steps)
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, on_text))
+    # Menu conversation
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(botapp.on_menu, pattern=r"^menu_")],
+        states={
+            ST_SET_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, botapp.step_set_api_key)],
+            ST_SET_API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, botapp.step_set_api_secret)],
+            ST_SET_PASSPHRASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botapp.step_set_passphrase)],
+            ST_SET_ALERT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, botapp.step_set_alert_channel)],
+            ST_SET_RISK: [MessageHandler(filters.TEXT & ~filters.COMMAND, botapp.step_set_risk)],
+            ST_SET_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botapp.step_set_leverage)],
+        },
+        fallbacks=[CommandHandler("start", botapp.cmd_start)],
+        allow_reentry=True,
+    )
 
-    # catch-all for forwarded message registration + channel posts signal detection
-    app.add_handler(MessageHandler(filters.ALL, on_any_message))
+    # Commands
+    app.add_handler(CommandHandler("start", botapp.cmd_start))
+    app.add_handler(CommandHandler("status", botapp.cmd_status))
+    app.add_handler(CommandHandler("toggle_auto_trading", botapp.cmd_toggle))
+    app.add_handler(CommandHandler("set_risk", botapp.cmd_set_risk))
+    app.add_handler(CommandHandler("set_leverage", botapp.cmd_set_leverage))
+    app.add_handler(CommandHandler("link_here", botapp.cmd_link_here))
 
-    log.info("Bot running...")
-    await app.run_polling(close_loop=False)
+    # Buttons
+    app.add_handler(conv)
+
+    # Channel posts handler (THIS is where signals are detected)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS & filters.TEXT, botapp.on_channel_post))
+
+    return app
+
+
+def post_init_factory(delete_webhook: bool):
+    async def _post_init(app: Application):
+        if delete_webhook:
+            try:
+                await app.bot.delete_webhook(drop_pending_updates=True)
+                logger.info("delete_webhook(drop_pending_updates=True) OK")
+            except Exception as e:
+                logger.warning("delete_webhook failed: %s", e)
+    return _post_init
+
+
+def main():
+    app = build_app()
+    logger.info("Starting bot... EXCHANGE=%s SAFE_MODE=%s", EXCHANGE, SAFE_MODE)
+    # ✅ IMPORTANT: no asyncio.run() here -> avoids event loop error
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
