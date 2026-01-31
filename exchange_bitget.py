@@ -1,45 +1,40 @@
-# exchange_bitget.py
 import os
 import ccxt
 
+def normalize_symbol_to_ccxt(sym: str) -> str:
+    s = (sym or "").upper().replace("-", "").replace("_", "").replace(" ", "")
+    if s.endswith("USDT") and "/" not in s:
+        return f"{s[:-4]}/USDT"
+    return sym
+
 class BitgetExecutor:
-    def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
+    def __init__(self):
+        k = os.getenv("BITGET_API_KEY", "")
+        s = os.getenv("BITGET_API_SECRET", "")
+        p = os.getenv("BITGET_API_PASSPHRASE", "")
+        if not (k and s and p):
+            raise RuntimeError("Missing BITGET_API_KEY / BITGET_API_SECRET / BITGET_API_PASSPHRASE")
+
         default_type = os.getenv("BITGET_DEFAULT_TYPE", "swap")  # swap|spot
         self.ex = ccxt.bitget({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "password": api_passphrase,  # Bitget passphrase via CCXT
-            "options": {"defaultType": default_type},
+            "apiKey": k,
+            "secret": s,
+            "password": p,  # passphrase
             "enableRateLimit": True,
+            "options": {"defaultType": default_type},
         })
 
-        # Sandbox (kalau kamu benar-benar punya demo env yang cocok)
-        sandbox = os.getenv("BITGET_SANDBOX", "false").lower() == "true"
-        if sandbox:
+        if os.getenv("BITGET_SANDBOX", "false").lower() == "true":
             self.ex.set_sandbox_mode(True)
 
-    def execute_signal(self, symbol: str, direction: str, amount: float, leverage: int | None = None,
-                       tp: float | None = None, sl: float | None = None):
-        """
-        symbol: contoh 'BTC/USDT' (CCXT unified)
-        direction: 'LONG' / 'SHORT'
-        amount: ukuran kontrak/qty (sesuaikan dengan market type)
-        leverage: optional
-        tp/sl: optional (kalau bot kamu pasang TP/SL setelah entry, itu perlu logic tambahan)
-        """
-        side = "buy" if direction.upper() == "LONG" else "sell"
+    def market_order(self, symbol: str, direction: str, amount: float, leverage: int | None = None):
+        ccxt_symbol = normalize_symbol_to_ccxt(symbol)
+        side = "buy" if (direction or "").upper() in ("LONG", "BUY") else "sell"
 
         params = {}
-        # Untuk swap (futures) Bitget, sering perlu tradeSide=open untuk hedge-mode.
-        # Kita set default aman:
         if os.getenv("BITGET_DEFAULT_TYPE", "swap") == "swap":
-            params["tradeSide"] = "open"
             params["marginMode"] = os.getenv("BITGET_MARGIN_MODE", "isolated")
-
             if leverage:
-                # CCXT punya setLeverage di banyak exchange; Bitget support untuk swap.
-                # Kalau error di environment kamu, tinggal comment baris ini.
-                self.ex.set_leverage(int(leverage), symbol)
+                self.ex.set_leverage(int(leverage), ccxt_symbol)
 
-        order = self.ex.create_order(symbol, "market", side, amount, None, params)
-        return order
+        return self.ex.create_order(ccxt_symbol, "market", side, float(amount), None, params)
